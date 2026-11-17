@@ -1,0 +1,370 @@
+AWSTemplateFormatVersion: "2010-09-09"
+# CHANGE: Description updated. The class lab launched one web server in the
+# public subnet. This version builds the café application tier from the
+# Elasticity and Availability assignment: bastion host, Application Load
+# Balancer, Auto Scaling group of app servers and a Multi-AZ RDS database.
+Description: >-
+  Café application layer. Bastion host, internet-facing Application Load
+  Balancer, Auto Scaling group of café app servers in private subnets, and a
+  Multi-AZ MariaDB database restored from a snapshot. Imports network IDs
+  from the lab-network stack.
+
+Parameters:
+  NetworkStackName:
+    # Kept from the class lab: names the network stack whose exports are used.
+    Type: String
+    Default: lab-network
+    Description: Name of the stack created from lab-network.yaml.
+
+  EnvironmentName:
+    # CHANGE: New parameter. Prefix for Name tags.
+    Type: String
+    Default: cafe-ha
+    Description: Prefix for the Name tag of every resource.
+
+  WorkstationIp:
+    # CHANGE: New parameter required by the assignment. The bastion accepts
+    # SSH only from this address. No default, so it must be entered at
+    # deployment.
+    Type: String
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/32$
+    ConstraintDescription: Must be a single IPv4 address ending in /32.
+    Description: Public IP of your workstation in CIDR form, e.g. 203.0.113.5/32.
+
+  KeyName:
+    # CHANGE: New parameter. Key pair for SSH to the bastion and app servers.
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: cafe-key
+    Description: Existing EC2 key pair.
+
+  BastionAmiId:
+    # CHANGE: New parameter. Latest Amazon Linux 2023 AMI, looked up from the
+    # public SSM parameter so the template works in any Region.
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: AMI for the bastion host.
+
+  BastionInstanceType:
+    # CHANGE: New parameter.
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t2.micro]
+    Description: Instance type of the bastion host.
+
+  AppAmiId:
+    # CHANGE: New parameter. AMI of the working café app server (cafe-app-ami).
+    Type: AWS::EC2::Image::Id
+    Default: ami-039b7d4c4157f889d
+    Description: AMI containing Apache, PHP and the café application.
+
+  AppInstanceType:
+    # CHANGE: Instance type is now a parameter (was fixed in the class lab).
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3.medium, t2.micro]
+    Description: Instance type of the app servers.
+
+  AppInstanceProfile:
+    # CHANGE: New parameter. Existing IAM instance profile that lets the app
+    # servers read the /cafe/* secrets from Secrets Manager.
+    Type: String
+    Default: cafe-app-role
+    Description: Name of an existing IAM instance profile for the app servers.
+
+  AsgMinSize:
+    # CHANGE: New parameter required by the assignment.
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: Minimum number of app servers.
+
+  AsgMaxSize:
+    # CHANGE: New parameter required by the assignment.
+    Type: Number
+    Default: 6
+    MinValue: 1
+    Description: Maximum number of app servers.
+
+  AsgDesiredCapacity:
+    # CHANGE: New parameter. Must lie between the minimum and maximum.
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: Number of app servers to start with.
+
+  CpuTargetValue:
+    # CHANGE: New parameter. Target average CPU for the scaling policy.
+    Type: Number
+    Default: 25
+    MinValue: 1
+    MaxValue: 100
+    Description: Average CPU percentage the Auto Scaling group aims for.
+
+  HealthCheckPath:
+    # CHANGE: New parameter. Path the load balancer checks on each server.
+    Type: String
+    Default: /
+    Description: Health check path for the target group.
+
+  DBSnapshotIdentifier:
+    # CHANGE: New parameter. Snapshot that holds the café menu and orders.
+    Type: String
+    Default: cafe-db-snapshot
+    Description: RDS snapshot to restore the café database from.
+
+  DBInstanceClass:
+    # CHANGE: New parameter.
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: [db.t3.micro, db.t3.small, db.t4g.micro]
+    Description: RDS instance class.
+
+  DBMultiAZ:
+    # CHANGE: New parameter. Set to false for a cheaper single-zone test.
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Create a standby database in the second zone.
+
+Resources:
+  # ---------------- Security groups ----------------
+
+  BastionSecurityGroup:
+    # CHANGE: New resource. SSH only from the WorkstationIp parameter.
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH from the workstation only
+      VpcId: !ImportValue
+        Fn::Sub: ${NetworkStackName}-VPCID
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref WorkstationIp
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-bastion-sg
+
+  AlbSecurityGroup:
+    # CHANGE: New resource. HTTP from the internet to the load balancer.
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from the internet to the load balancer
+      VpcId: !ImportValue
+        Fn::Sub: ${NetworkStackName}-VPCID
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-alb-sg
+
+  AppSecurityGroup:
+    # CHANGE: Replaces the class lab's web security group, which allowed HTTP
+    # from anywhere. App servers now accept HTTP only from the load balancer
+    # and SSH only from the bastion.
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from the load balancer and SSH from the bastion
+      VpcId: !ImportValue
+        Fn::Sub: ${NetworkStackName}-VPCID
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref BastionSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-app-sg
+
+  DBSecurityGroup:
+    # CHANGE: New resource. MySQL/MariaDB port only from the app servers.
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow MySQL from the app servers to the database
+      VpcId: !ImportValue
+        Fn::Sub: ${NetworkStackName}-VPCID
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-db-sg
+
+  # ---------------- Bastion host ----------------
+
+  BastionHost:
+    # CHANGE: New resource. Replaces the class lab's single public web server
+    # with a bastion in public subnet 1, the only SSH entry point.
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref BastionAmiId
+      InstanceType: !Ref BastionInstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !ImportValue
+        Fn::Sub: ${NetworkStackName}-PublicSubnet1ID
+      SecurityGroupIds:
+        - !Ref BastionSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-bastion
+
+  # ---------------- Database ----------------
+
+  DBSubnetGroup:
+    # CHANGE: New resource. Places the database in both private subnets.
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for the café database
+      SubnetIds:
+        - !ImportValue
+          Fn::Sub: ${NetworkStackName}-PrivateSubnet1ID
+        - !ImportValue
+          Fn::Sub: ${NetworkStackName}-PrivateSubnet2ID
+
+  CafeDatabase:
+    # CHANGE: New resource. Restores the café database from a snapshot as a
+    # Multi-AZ instance. DeletionPolicy Delete lets stack deletion remove it
+    # without leaving a final snapshot, which simplifies clean-up.
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBSnapshotIdentifier: !Ref DBSnapshotIdentifier
+      Engine: mariadb
+      DBInstanceClass: !Ref DBInstanceClass
+      MultiAZ: !Ref DBMultiAZ
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DBSecurityGroup
+      PubliclyAccessible: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-db
+
+  # ---------------- Load balancer ----------------
+
+  AppTargetGroup:
+    # CHANGE: New resource. Registers app servers and checks their health.
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !ImportValue
+        Fn::Sub: ${NetworkStackName}-VPCID
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckPath: !Ref HealthCheckPath
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-app-tg
+
+  AppLoadBalancer:
+    # CHANGE: New resource. Internet-facing load balancer in both public
+    # subnets.
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !ImportValue
+          Fn::Sub: ${NetworkStackName}-PublicSubnet1ID
+        - !ImportValue
+          Fn::Sub: ${NetworkStackName}-PublicSubnet2ID
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-alb
+
+  HttpListener:
+    # CHANGE: New resource. Forwards HTTP on port 80 to the target group.
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref AppLoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AppTargetGroup
+
+  # ---------------- Auto Scaling ----------------
+
+  AppLaunchTemplate:
+    # CHANGE: New resource. Replaces the class lab's single EC2 instance with
+    # a launch template built from the café app AMI.
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref AppAmiId
+        InstanceType: !Ref AppInstanceType
+        KeyName: !Ref KeyName
+        IamInstanceProfile:
+          Name: !Ref AppInstanceProfile
+        SecurityGroupIds:
+          - !Ref AppSecurityGroup
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub ${EnvironmentName}-app
+
+  AppAutoScalingGroup:
+    # CHANGE: New resource. Size comes from the AsgMinSize, AsgMaxSize and
+    # AsgDesiredCapacity parameters; servers run in both private subnets.
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: CafeDatabase
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AppLaunchTemplate
+        Version: !GetAtt AppLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref AsgMinSize
+      MaxSize: !Ref AsgMaxSize
+      DesiredCapacity: !Ref AsgDesiredCapacity
+      VPCZoneIdentifier:
+        - !ImportValue
+          Fn::Sub: ${NetworkStackName}-PrivateSubnet1ID
+        - !ImportValue
+          Fn::Sub: ${NetworkStackName}-PrivateSubnet2ID
+      TargetGroupARNs:
+        - !Ref AppTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+
+  CpuTargetTrackingPolicy:
+    # CHANGE: New resource. Adds or removes servers to hold average CPU near
+    # the CpuTargetValue parameter.
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AppAutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: !Ref CpuTargetValue
+
+Outputs:
+  # CHANGE: Outputs replaced. The class lab returned the web server's IP;
+  # these return what is needed to reach and verify the café.
+  CafeUrl:
+    Description: Café application URL through the load balancer
+    Value: !Sub http://${AppLoadBalancer.DNSName}/cafe
+
+  BastionPublicIp:
+    Description: Public IP of the bastion host
+    Value: !GetAtt BastionHost.PublicIp
+
+  DatabaseEndpoint:
+    Description: Endpoint to store in the /cafe/dbUrl secret
+    Value: !GetAtt CafeDatabase.Endpoint.Address
+
+  AutoScalingGroupName:
+    Description: Name of the Auto Scaling group
+    Value: !Ref AppAutoScalingGroup

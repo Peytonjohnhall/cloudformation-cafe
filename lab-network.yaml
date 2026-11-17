@@ -1,0 +1,296 @@
+AWSTemplateFormatVersion: "2010-09-09"
+# CHANGE: Description updated. The class lab built one VPC with a single public
+# subnet. This version builds the café network from the Elasticity and
+# Availability assignment: two Availability Zones, a public and a private
+# subnet in each, and one NAT gateway per zone.
+Description: >-
+  Café network layer. VPC across two Availability Zones with two public
+  subnets, two private subnets, an internet gateway and one NAT gateway per
+  zone. Exports its IDs for the lab-application stack.
+
+# CHANGE: Added a Parameters section. The class lab hard-coded the CIDR blocks
+# and zone; these parameters make the template reusable in other Regions,
+# accounts or address ranges without editing the file.
+Parameters:
+  EnvironmentName:
+    # CHANGE: Prefix used in every Name tag so several copies can coexist.
+    Type: String
+    Default: cafe-ha
+    Description: Prefix for the Name tag of every resource.
+
+  VpcCidr:
+    # CHANGE: VPC range is now a parameter (was fixed at 10.0.0.0/16).
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+    Description: CIDR block of the VPC.
+
+  AvailabilityZone1:
+    # CHANGE: New parameter. The first zone for the subnets.
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: us-east-1a
+    Description: First Availability Zone.
+
+  AvailabilityZone2:
+    # CHANGE: New parameter. A second zone for high availability.
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: us-east-1b
+    Description: Second Availability Zone.
+
+  PublicSubnet1Cidr:
+    # CHANGE: Public subnet range is now a parameter.
+    Type: String
+    Default: 10.0.0.0/24
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+    Description: CIDR block of the public subnet in zone 1.
+
+  PublicSubnet2Cidr:
+    # CHANGE: New parameter for the second public subnet.
+    Type: String
+    Default: 10.0.1.0/24
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+    Description: CIDR block of the public subnet in zone 2.
+
+  PrivateSubnet1Cidr:
+    # CHANGE: New parameter for the first private subnet.
+    Type: String
+    Default: 10.0.2.0/23
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+    Description: CIDR block of the private subnet in zone 1.
+
+  PrivateSubnet2Cidr:
+    # CHANGE: New parameter for the second private subnet.
+    Type: String
+    Default: 10.0.4.0/23
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+    Description: CIDR block of the private subnet in zone 2.
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      # CHANGE: CidrBlock now comes from the VpcCidr parameter.
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          # CHANGE: Name built from the EnvironmentName parameter.
+          Value: !Sub ${EnvironmentName}-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-igw
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # ---------------- Public subnets ----------------
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      # CHANGE: CIDR and zone now come from parameters.
+      CidrBlock: !Ref PublicSubnet1Cidr
+      AvailabilityZone: !Ref AvailabilityZone1
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-subnet-public1
+
+  PublicSubnet2:
+    # CHANGE: New resource. Second public subnet so the load balancer and NAT
+    # gateways span two zones.
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: !Ref AvailabilityZone2
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-subnet-public2
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-rtb-public
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    # CHANGE: New resource. Links the second public subnet to the public
+    # route table.
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # ---------------- NAT gateways ----------------
+  # CHANGE: New section. One zonal NAT gateway in each public subnet so the
+  # private subnets reach the internet even if one zone fails.
+
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-nat-eip1
+
+  NatGateway2EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-nat-eip2
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-nat1
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway2EIP.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-nat2
+
+  # ---------------- Private subnets ----------------
+  # CHANGE: New section. The class lab had no private subnets. The app
+  # servers and the database run here, out of reach of the internet.
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Ref AvailabilityZone1
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-subnet-private1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Ref AvailabilityZone2
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-subnet-private2
+
+  PrivateRouteTable1:
+    # One route table per zone, each pointing at the NAT gateway in the same
+    # zone, as in the Elasticity and Availability assignment.
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-rtb-private1
+
+  PrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable1
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-rtb-private2
+
+  PrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway2
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable2
+
+Outputs:
+  # The application stack imports these values with Fn::ImportValue, using the
+  # network stack's name as the prefix.
+  VPC:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub ${AWS::StackName}-VPCID
+
+  PublicSubnet1:
+    # CHANGE: Renamed from the class lab's single SubnetID export.
+    Description: Public subnet in zone 1
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: !Sub ${AWS::StackName}-PublicSubnet1ID
+
+  PublicSubnet2:
+    # CHANGE: New export.
+    Description: Public subnet in zone 2
+    Value: !Ref PublicSubnet2
+    Export:
+      Name: !Sub ${AWS::StackName}-PublicSubnet2ID
+
+  PrivateSubnet1:
+    # CHANGE: New export.
+    Description: Private subnet in zone 1
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub ${AWS::StackName}-PrivateSubnet1ID
+
+  PrivateSubnet2:
+    # CHANGE: New export.
+    Description: Private subnet in zone 2
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub ${AWS::StackName}-PrivateSubnet2ID
